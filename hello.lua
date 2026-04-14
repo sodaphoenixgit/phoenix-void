@@ -169,12 +169,28 @@ end
 --    The real character stays server-side at the desync position.
 -- ═══════════════════════════════════════════════════════════════════════════
 
+-- ═══════════════════════════════════════════════════════════════════════════
+--  DESYNC SYSTEM
+--
+--  Three modes for what the server sees your real character doing:
+--
+--  main    → real HRP voidspams using main tab range/interval/tpCount
+--  near    → real HRP follows nearest player then void, like near player tab
+--  tp aura → real HRP locked onto nearest player every frame (old "near")
+--
+--  A Heartbeat connection writes desyncTargetCF to the real HRP every frame.
+--  For main/near modes a separate task loop updates desyncTargetCF on their
+--  own interval. For tp aura the heartbeat itself picks the target each frame.
+-- ═══════════════════════════════════════════════════════════════════════════
+
 local desyncEnabled    = false
-local desyncConn       = nil   -- Heartbeat: force real HRP server-side
+local desyncConn       = nil   -- Heartbeat: writes desyncTargetCF to real HRP
 local camConn          = nil   -- RenderStepped: puppet movement + camera
+local modeLoopRunning  = false -- for main/near task loops
 local fakeModel        = nil
 local fakePart         = nil
-local desyncNearTarget = nil
+local desyncNearTarget = nil   -- locked target for tp aura mode
+local desyncTargetCF   = nil   -- shared CFrame that heartbeat writes each frame
 local savedCamSubject  = nil
 local savedCamType     = nil
 
@@ -187,9 +203,104 @@ UIS.InputEnded:Connect(function(i)
 end)
 local KC = Enum.KeyCode
 
+-- helpers shared with desync
+local function desyncRandCF()
+    return CFrame.new(
+        cfg.rangeMin + math.random() * (cfg.rangeMax - cfg.rangeMin),
+        cfg.yMin     + math.random() * (cfg.yMax     - cfg.yMin),
+        cfg.rangeMin + math.random() * (cfg.rangeMax - cfg.rangeMin)
+    )
+end
+
+local desyncLockedNear = nil  -- locked target for near mode (follows like near player tab)
+
+local function desyncNearTargetDead(t)
+    if not t then return true end
+    if not t.Parent then return true end
+    local h = t.Parent:FindFirstChildOfClass('Humanoid')
+    return not h or h.Health <= 0
+end
+
+local function getNearestForDesync()
+    local pos = (fakePart and fakePart.Position) or (hrp and hrp.Position)
+    if not pos then return nil end
+    local best, bd = nil, math.huge
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player then
+            local c2 = p.Character
+            local r2 = c2 and c2:FindFirstChild('HumanoidRootPart')
+            if r2 then
+                local d = (r2.Position - pos).Magnitude
+                if d < bd then bd = d; best = r2 end
+            end
+        end
+    end
+    return best
+end
+
+-- waits seconds while desync is enabled; returns true if we should break
+local function desyncWait(seconds)
+    if seconds <= 0 then task.wait(); return not (modeLoopRunning and desyncEnabled) end
+    local t0 = tick()
+    repeat task.wait()
+    until not (modeLoopRunning and desyncEnabled) or (tick() - t0) >= seconds
+    return not (modeLoopRunning and desyncEnabled)
+end
+
+local function startModeLoop()
+    if modeLoopRunning then return end
+    modeLoopRunning = true
+    task.spawn(function()
+        while modeLoopRunning and desyncEnabled do
+            local mode = cfg.desyncMode
+
+            if mode == 'main' then
+                -- voidspam: set desyncTargetCF to a random position every interval
+                desyncTargetCF = desyncRandCF()
+                if desyncWait(cfg.interval) then break end
+
+            elseif mode == 'near' then
+                -- phase 1: follow nearest player for nearDuration seconds
+                -- uses same offsets/duration as near player tab
+                local followEnd = tick() + cfg.nearDuration
+                repeat
+                    if desyncNearTargetDead(desyncLockedNear) then desyncLockedNear = nil end
+                    if not desyncLockedNear then desyncLockedNear = getNearestForDesync() end
+                    if desyncLockedNear then
+                        desyncTargetCF = desyncLockedNear.CFrame
+                            * CFrame.new(cfg.offsetX, cfg.offsetY, cfg.offsetZ)
+                    else
+                        desyncTargetCF = desyncRandCF()
+                    end
+                    if desyncWait(cfg.interval) then break end
+                until not (modeLoopRunning and desyncEnabled) or tick() >= followEnd
+
+                if not (modeLoopRunning and desyncEnabled) then break end
+
+                -- phase 2: void (same as main voidspam) for voidDuration seconds
+                local voidEnd = tick() + cfg.voidDuration
+                repeat
+                    desyncTargetCF = desyncRandCF()
+                    if desyncWait(cfg.interval) then break end
+                until not (modeLoopRunning and desyncEnabled) or tick() >= voidEnd
+
+            else
+                -- tp aura: heartbeat handles it directly, just yield
+                task.wait()
+            end
+        end
+        modeLoopRunning = false
+    end)
+end
+
 local function cleanupDesync()
     if camConn    then camConn:Disconnect();    camConn    = nil end
     if desyncConn then desyncConn:Disconnect(); desyncConn = nil end
+
+    modeLoopRunning  = false
+    desyncTargetCF   = nil
+    desyncLockedNear = nil
+    desyncNearTarget = nil
 
     local cam = workspace.CurrentCamera
     if cam then
@@ -198,14 +309,14 @@ local function cleanupDesync()
     end
 
     if fakeModel then pcall(function() fakeModel:Destroy() end); fakeModel = nil; fakePart = nil end
-    desyncNearTarget = nil
-    desyncEnabled    = false
+    desyncEnabled = false
 end
 
 local function startDesync()
     if desyncEnabled then return end
     if not hrp then return end
-    desyncEnabled = true
+    desyncEnabled  = true
+    desyncTargetCF = hrp.CFrame  -- initialise to current position
 
     -- build invisible puppet
     local model     = Instance.new('Model'); model.Name = 'DesyncPuppet'
@@ -230,43 +341,30 @@ local function startDesync()
     cam.CameraSubject= root
 
     -- puppet physics state
-    local velY       = 0
-    local grounded   = true
-    local floorY     = root.CFrame.Y
-    local facing     = root.CFrame
+    local velY    = 0
+    local grounded= true
+    local floorY  = root.CFrame.Y
+    local facing  = root.CFrame
 
     -- RenderStepped: drive puppet with WASD
     camConn = RunService.RenderStepped:Connect(function(dt)
         if not desyncEnabled or not fakePart then return end
-
-        local camCF  = workspace.CurrentCamera.CFrame
-        local fwd    = Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z)
-        local rgt    = Vector3.new(camCF.RightVector.X, 0, camCF.RightVector.Z)
+        local camCF = workspace.CurrentCamera.CFrame
+        local fwd   = Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z)
+        local rgt   = Vector3.new(camCF.RightVector.X, 0, camCF.RightVector.Z)
         if fwd.Magnitude > 0 then fwd = fwd.Unit end
         if rgt.Magnitude > 0 then rgt = rgt.Unit end
-
         local dir = Vector3.zero
         if keysDown[KC.W] or keysDown[KC.Up]    then dir = dir + fwd end
         if keysDown[KC.S] or keysDown[KC.Down]  then dir = dir - fwd end
         if keysDown[KC.D] or keysDown[KC.Right] then dir = dir + rgt end
         if keysDown[KC.A] or keysDown[KC.Left]  then dir = dir - rgt end
         if dir.Magnitude > 0 then dir = dir.Unit end
-
-        if keysDown[KC.Space] and grounded then
-            velY     = 50
-            grounded = false
-        end
+        if keysDown[KC.Space] and grounded then velY = 50; grounded = false end
         velY = velY - 196 * dt
-
         local cur  = fakePart.Position
         local newP = cur + Vector3.new(dir.X * cfg.desyncMoveSpeed, velY, dir.Z * cfg.desyncMoveSpeed) * dt
-
-        if newP.Y <= floorY and velY < 0 then
-            newP     = Vector3.new(newP.X, floorY, newP.Z)
-            velY     = 0
-            grounded = true
-        end
-
+        if newP.Y <= floorY and velY < 0 then newP = Vector3.new(newP.X, floorY, newP.Z); velY = 0; grounded = true end
         if dir.Magnitude > 0 then
             facing = CFrame.new(newP, newP + dir)
         else
@@ -276,34 +374,37 @@ local function startDesync()
         fakePart.CFrame = facing
     end)
 
-    -- Heartbeat: force real HRP server-side (replicates because player.Character unchanged)
+    -- Heartbeat: write desyncTargetCF to real HRP every frame
+    -- tp aura mode: also picks the target here so it's always fresh
     desyncConn = RunService.Heartbeat:Connect(function()
         if not desyncEnabled then return end
         local realHRP = character and character:FindFirstChild('HumanoidRootPart')
         if not realHRP then return end
 
-        if cfg.desyncMode == 'near' then
-            if not desyncNearTarget or not desyncNearTarget.Parent then
-                desyncNearTarget = getNearestRoot(fakePart and fakePart.Position)
-            end
-            local targetCF
+        local cf = desyncTargetCF
+        if cfg.desyncMode == 'tp aura' then
+            -- pick nearest player fresh every heartbeat
+            if desyncNearTargetDead(desyncNearTarget) then desyncNearTarget = nil end
+            if not desyncNearTarget then desyncNearTarget = getNearestForDesync() end
             if desyncNearTarget then
-                targetCF = desyncNearTarget.CFrame
-                         * CFrame.new(cfg.desyncNearOffsetX, cfg.desyncNearOffsetY, cfg.desyncNearOffsetZ)
+                cf = desyncNearTarget.CFrame
+                   * CFrame.new(cfg.desyncNearOffsetX, cfg.desyncNearOffsetY, cfg.desyncNearOffsetZ)
             else
-                targetCF = CFrame.new(cfg.desyncVoidX, cfg.desyncVoidY, cfg.desyncVoidZ)
+                cf = CFrame.new(cfg.desyncVoidX, cfg.desyncVoidY, cfg.desyncVoidZ)
             end
-            for _ = 1, cfg.desyncTpCount do realHRP.CFrame = targetCF end
-        else
-            local voidCF = CFrame.new(cfg.desyncVoidX, cfg.desyncVoidY, cfg.desyncVoidZ)
-            for _ = 1, cfg.desyncTpCount do realHRP.CFrame = voidCF end
+        end
+
+        if cf then
+            for _ = 1, cfg.desyncTpCount do realHRP.CFrame = cf end
         end
     end)
+
+    -- start the mode loop (handles main / near timing; tp aura is purely heartbeat-driven)
+    startModeLoop()
 end
 
 local function stopDesync()
     if not desyncEnabled then return end
-    -- snap real char back to puppet position before cleaning up
     local realHRP = character and character:FindFirstChild('HumanoidRootPart')
     if realHRP and fakePart then realHRP.CFrame = fakePart.CFrame end
     cleanupDesync()
@@ -548,11 +649,18 @@ BoxDesyncMain:AddLabel('mode')
 BoxDesyncMain:AddDropdown('DesyncMode', {
     Text    = 'desync mode',
     Default = 'main',
-    Values  = { 'main', 'near' },
-    Tooltip = 'main = real char frozen in void  |  near = real char on nearest player',
+    Values  = { 'main', 'near', 'tp aura' },
+    Tooltip = 'main = real char voidspams (uses main tab range)  |  near = follows nearest then void (uses near tab)  |  tp aura = locks onto nearest player every frame',
     Callback = function(val)
         cfg.desyncMode   = val
         desyncNearTarget = nil
+        desyncLockedNear = nil
+        -- restart mode loop so it picks up the new mode immediately
+        if desyncEnabled then
+            modeLoopRunning = false
+            task.wait(0.06)
+            startModeLoop()
+        end
     end,
 })
 
@@ -599,14 +707,23 @@ BoxDesyncMain:AddInput('DesyncVoidZ', {
 -- ─────────────────────────────────────
 --  desync: near player (right groupbox)
 -- ─────────────────────────────────────
-local BoxDesyncNear = Tabs.Desync:AddRightGroupbox('desync near player')
+local BoxDesyncNear = Tabs.Desync:AddRightGroupbox('desync modes')
 
-BoxDesyncNear:AddLabel('used when mode = "near"')
-BoxDesyncNear:AddLabel('server sees you locked onto')
-BoxDesyncNear:AddLabel('the nearest player.')
-BoxDesyncNear:AddLabel('puppet moves freely.')
+BoxDesyncNear:AddLabel('main mode:')
+BoxDesyncNear:AddLabel('real char voidspams using')
+BoxDesyncNear:AddLabel('main tab range + interval.')
+BoxDesyncNear:AddLabel('')
+BoxDesyncNear:AddLabel('near mode:')
+BoxDesyncNear:AddLabel('real char follows nearest')
+BoxDesyncNear:AddLabel('player then goes void,')
+BoxDesyncNear:AddLabel('using near tab offsets +')
+BoxDesyncNear:AddLabel('near/void durations.')
+BoxDesyncNear:AddLabel('')
+BoxDesyncNear:AddLabel('tp aura mode:')
+BoxDesyncNear:AddLabel('real char locked onto')
+BoxDesyncNear:AddLabel('nearest player every frame.')
 BoxDesyncNear:AddDivider()
-BoxDesyncNear:AddLabel('offset from target')
+BoxDesyncNear:AddLabel('tp aura offset from target')
 
 BoxDesyncNear:AddSlider('DesyncNearOffsetX',{Text='offset x',Default=2,Min=-50,Max=50,Rounding=1,Callback=function(v) cfg.desyncNearOffsetX=v end})
 BoxDesyncNear:AddInput('DesyncNearOffsetXText',{Text='offset x manual',Default='2',Numeric=true,Finished=true,ClearTextOnFocus=false,
@@ -624,8 +741,8 @@ BoxDesyncNear:AddInput('DesyncNearOffsetZText',{Text='offset z manual',Default='
         task.defer(function() if Options.DesyncNearOffsetZ then Options.DesyncNearOffsetZ:SetValue(math.clamp(n,-50,50)) end end) end})
 
 BoxDesyncNear:AddDivider()
-BoxDesyncNear:AddLabel('no nearby players?')
-BoxDesyncNear:AddLabel('auto-falls back to void freeze.')
+BoxDesyncNear:AddLabel('tp aura / near: no players?')
+BoxDesyncNear:AddLabel('falls back to void freeze.')
 
 -- UI Settings
 local MenuGroup = Tabs["UI Settings"]:AddLeftGroupbox("Menu")
