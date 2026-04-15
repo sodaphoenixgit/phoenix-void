@@ -21,9 +21,9 @@ local cfg = {
     yMax          =  10000,
     tpCount       = 7,
     nearEnabled   = false,
-    nearDuration  = 0.25,
-    voidDuration  = 1,
-    offsetX       = 0,
+    nearDuration  = 3,
+    voidDuration  = 2,
+    offsetX       = 2,
     offsetY       = 0,
     offsetZ       = 0,
     clickEnabled  = false,
@@ -53,30 +53,7 @@ local function grabChar(char)
     humanoid  = char:WaitForChild('Humanoid')
 end
 grabChar(player.Character or player.CharacterAdded:Wait())
-player.CharacterAdded:Connect(function(char)
-    grabChar(char)
-    -- if desync was active when we died, rebuild the puppet with the new character
-    if desyncEnabled then
-        -- small wait so the new character fully loads before we touch it
-        task.wait(0.2)
-        -- tear down old connections and puppet without snapping position
-        if camConn    then camConn:Disconnect();    camConn    = nil end
-        if desyncConn then desyncConn:Disconnect(); desyncConn = nil end
-        modeLoopRunning = false
-        if fakeModel then pcall(function() fakeModel:Destroy() end); fakeModel = nil; fakePart = nil end
-        local cam = workspace.CurrentCamera
-        if cam then
-            if savedCamSubject then cam.CameraSubject = savedCamSubject; savedCamSubject = nil end
-            if savedCamType    then cam.CameraType    = savedCamType;    savedCamType    = nil end
-        end
-        desyncEnabled    = false
-        desyncNearTarget = nil
-        desyncLockedNear = nil
-        desyncTargetCF   = nil
-        -- restart cleanly with the new character
-        startDesync()
-    end
-end)
+player.CharacterAdded:Connect(grabChar)
 
 -- ─── voidspam helpers ────────────────────────────────────────────────────────
 local function randInRange()
@@ -226,15 +203,6 @@ UIS.InputEnded:Connect(function(i)
 end)
 local KC = Enum.KeyCode
 
--- track M1 for click-void mode, ignoring gpe so it works even when menu is open
-local mb1Down = false
-UIS.InputBegan:Connect(function(i)
-    if i.UserInputType == Enum.UserInputType.MouseButton1 then mb1Down = true end
-end)
-UIS.InputEnded:Connect(function(i)
-    if i.UserInputType == Enum.UserInputType.MouseButton1 then mb1Down = false end
-end)
-
 -- helpers shared with desync
 local function desyncRandCF()
     return CFrame.new(
@@ -317,7 +285,7 @@ local function startModeLoop()
                 until not (modeLoopRunning and desyncEnabled) or tick() >= voidEnd
 
             else
-                -- tp aura / click void: heartbeat handles these directly, just yield
+                -- tp aura: heartbeat handles it directly, just yield
                 task.wait()
             end
         end
@@ -379,8 +347,6 @@ local function startDesync()
     local facing  = root.CFrame
 
     -- RenderStepped: drive puppet with WASD
-    -- use UIS:IsKeyDown() directly — ignores game-processed flag so
-    -- movement works even when the LinoriaLib menu is open/focused
     camConn = RunService.RenderStepped:Connect(function(dt)
         if not desyncEnabled or not fakePart then return end
         local camCF = workspace.CurrentCamera.CFrame
@@ -389,12 +355,12 @@ local function startDesync()
         if fwd.Magnitude > 0 then fwd = fwd.Unit end
         if rgt.Magnitude > 0 then rgt = rgt.Unit end
         local dir = Vector3.zero
-        if UIS:IsKeyDown(KC.W) or UIS:IsKeyDown(KC.Up)    then dir = dir + fwd end
-        if UIS:IsKeyDown(KC.S) or UIS:IsKeyDown(KC.Down)  then dir = dir - fwd end
-        if UIS:IsKeyDown(KC.D) or UIS:IsKeyDown(KC.Right) then dir = dir + rgt end
-        if UIS:IsKeyDown(KC.A) or UIS:IsKeyDown(KC.Left)  then dir = dir - rgt end
+        if keysDown[KC.W] or keysDown[KC.Up]    then dir = dir + fwd end
+        if keysDown[KC.S] or keysDown[KC.Down]  then dir = dir - fwd end
+        if keysDown[KC.D] or keysDown[KC.Right] then dir = dir + rgt end
+        if keysDown[KC.A] or keysDown[KC.Left]  then dir = dir - rgt end
         if dir.Magnitude > 0 then dir = dir.Unit end
-        if UIS:IsKeyDown(KC.Space) and grounded then velY = 50; grounded = false end
+        if keysDown[KC.Space] and grounded then velY = 50; grounded = false end
         velY = velY - 196 * dt
         local cur  = fakePart.Position
         local newP = cur + Vector3.new(dir.X * cfg.desyncMoveSpeed, velY, dir.Z * cfg.desyncMoveSpeed) * dt
@@ -409,39 +375,21 @@ local function startDesync()
     end)
 
     -- Heartbeat: write desyncTargetCF to real HRP every frame
-    -- tp aura + click void: also pick target here every heartbeat
+    -- tp aura mode: also picks the target here so it's always fresh
     desyncConn = RunService.Heartbeat:Connect(function()
         if not desyncEnabled then return end
         local realHRP = character and character:FindFirstChild('HumanoidRootPart')
         if not realHRP then return end
 
         local cf = desyncTargetCF
-
         if cfg.desyncMode == 'tp aura' then
-            -- pick nearest fresh every heartbeat
+            -- pick nearest player fresh every heartbeat
             if desyncNearTargetDead(desyncNearTarget) then desyncNearTarget = nil end
             if not desyncNearTarget then desyncNearTarget = getNearestForDesync() end
             if desyncNearTarget then
                 cf = desyncNearTarget.CFrame
                    * CFrame.new(cfg.desyncNearOffsetX, cfg.desyncNearOffsetY, cfg.desyncNearOffsetZ)
             else
-                cf = CFrame.new(cfg.desyncVoidX, cfg.desyncVoidY, cfg.desyncVoidZ)
-            end
-
-        elseif cfg.desyncMode == 'click void' then
-            if mb1Down then
-                -- M1 held: tp real char to nearest player
-                if desyncNearTargetDead(desyncNearTarget) then desyncNearTarget = nil end
-                if not desyncNearTarget then desyncNearTarget = getNearestForDesync() end
-                if desyncNearTarget then
-                    cf = desyncNearTarget.CFrame
-                       * CFrame.new(cfg.desyncNearOffsetX, cfg.desyncNearOffsetY, cfg.desyncNearOffsetZ)
-                else
-                    cf = CFrame.new(cfg.desyncVoidX, cfg.desyncVoidY, cfg.desyncVoidZ)
-                end
-            else
-                -- M1 not held: stay in void
-                desyncNearTarget = nil  -- reset so next click re-acquires nearest
                 cf = CFrame.new(cfg.desyncVoidX, cfg.desyncVoidY, cfg.desyncVoidZ)
             end
         end
@@ -701,13 +649,12 @@ BoxDesyncMain:AddLabel('mode')
 BoxDesyncMain:AddDropdown('DesyncMode', {
     Text    = 'desync mode',
     Default = 'main',
-    Values  = { 'main', 'near', 'tp aura', 'click void' },
-    Tooltip = 'main = voidspam  |  near = follow then void  |  tp aura = lock nearest every frame  |  click void = void until m1 held',
+    Values  = { 'main', 'near', 'tp aura' },
+    Tooltip = 'main = real char voidspams (uses main tab range)  |  near = follows nearest then void (uses near tab)  |  tp aura = locks onto nearest player every frame',
     Callback = function(val)
         cfg.desyncMode   = val
         desyncNearTarget = nil
         desyncLockedNear = nil
-        mb1Down          = false
         -- restart mode loop so it picks up the new mode immediately
         if desyncEnabled then
             modeLoopRunning = false
@@ -762,22 +709,21 @@ BoxDesyncMain:AddInput('DesyncVoidZ', {
 -- ─────────────────────────────────────
 local BoxDesyncNear = Tabs.Desync:AddRightGroupbox('desync modes')
 
-BoxDesyncNear:AddLabel('main:')
-BoxDesyncNear:AddLabel('voidspams using main range.')
+BoxDesyncNear:AddLabel('main mode:')
+BoxDesyncNear:AddLabel('real char voidspams using')
+BoxDesyncNear:AddLabel('main tab range + interval.')
 BoxDesyncNear:AddLabel('')
-BoxDesyncNear:AddLabel('near:')
-BoxDesyncNear:AddLabel('follows nearest → void,')
-BoxDesyncNear:AddLabel('uses near tab settings.')
+BoxDesyncNear:AddLabel('near mode:')
+BoxDesyncNear:AddLabel('real char follows nearest')
+BoxDesyncNear:AddLabel('player then goes void,')
+BoxDesyncNear:AddLabel('using near tab offsets +')
+BoxDesyncNear:AddLabel('near/void durations.')
 BoxDesyncNear:AddLabel('')
-BoxDesyncNear:AddLabel('tp aura:')
-BoxDesyncNear:AddLabel('locks onto nearest every frame.')
-BoxDesyncNear:AddLabel('')
-BoxDesyncNear:AddLabel('click void:')
-BoxDesyncNear:AddLabel('void when m1 not held.')
-BoxDesyncNear:AddLabel('hold m1 → tp to nearest.')
-BoxDesyncNear:AddLabel('release → back to void.')
+BoxDesyncNear:AddLabel('tp aura mode:')
+BoxDesyncNear:AddLabel('real char locked onto')
+BoxDesyncNear:AddLabel('nearest player every frame.')
 BoxDesyncNear:AddDivider()
-BoxDesyncNear:AddLabel('tp aura / click void offset:')
+BoxDesyncNear:AddLabel('tp aura offset from target')
 
 BoxDesyncNear:AddSlider('DesyncNearOffsetX',{Text='offset x',Default=2,Min=-50,Max=50,Rounding=1,Callback=function(v) cfg.desyncNearOffsetX=v end})
 BoxDesyncNear:AddInput('DesyncNearOffsetXText',{Text='offset x manual',Default='2',Numeric=true,Finished=true,ClearTextOnFocus=false,
