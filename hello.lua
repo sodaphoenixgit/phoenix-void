@@ -1,5 +1,4 @@
--- vanadium voidspam + desync
--- localscript → starterplayerscripts
+-- 
 
 local repo         = 'https://raw.githubusercontent.com/mstudio45/LinoriaLib/main/'
 local Library      = loadstring(game:HttpGet(repo .. 'Library.lua'))()
@@ -53,7 +52,30 @@ local function grabChar(char)
     humanoid  = char:WaitForChild('Humanoid')
 end
 grabChar(player.Character or player.CharacterAdded:Wait())
-player.CharacterAdded:Connect(grabChar)
+player.CharacterAdded:Connect(function(char)
+    grabChar(char)
+    -- if desync was active when we died, rebuild the puppet with the new character
+    if desyncEnabled then
+        -- small wait so the new character fully loads before we touch it
+        task.wait(0.2)
+        -- tear down old connections and puppet without snapping position
+        if camConn    then camConn:Disconnect();    camConn    = nil end
+        if desyncConn then desyncConn:Disconnect(); desyncConn = nil end
+        modeLoopRunning = false
+        if fakeModel then pcall(function() fakeModel:Destroy() end); fakeModel = nil; fakePart = nil end
+        local cam = workspace.CurrentCamera
+        if cam then
+            if savedCamSubject then cam.CameraSubject = savedCamSubject; savedCamSubject = nil end
+            if savedCamType    then cam.CameraType    = savedCamType;    savedCamType    = nil end
+        end
+        desyncEnabled    = false
+        desyncNearTarget = nil
+        desyncLockedNear = nil
+        desyncTargetCF   = nil
+        -- restart cleanly with the new character
+        startDesync()
+    end
+end)
 
 -- ─── voidspam helpers ────────────────────────────────────────────────────────
 local function randInRange()
@@ -753,7 +775,7 @@ MenuGroup:AddDivider()
 MenuGroup:AddLabel("Menu bind"):AddKeyPicker("MenuKeybind", { Default = "RightShift", NoUI = true, Text = "Menu keybind" })
 MenuGroup:AddButton("Unload", function() Library:Unload() end)
 
-Library.ToggleKeybind = Options.MenuKeybind -- Allows you to have a custom keybind for the menu
+Library.ToggleKeybind = Options.MenuKeybind
 
 ThemeManager:SetLibrary(Library)
 SaveManager:SetLibrary(Library)
